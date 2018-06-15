@@ -5,7 +5,8 @@
             [coast.queries :as queries]
             [coast.utils :as utils]
             [coast.sql :as sql]
-            [coast.time :as time])
+            [coast.pull.db]
+            [coast.schema :as schema])
   (:refer-clojure :exclude [drop update]))
 
 (defn not-null-constraint [s]
@@ -33,8 +34,11 @@
              errors# (merge err1# err2#)]
          (if (empty? errors#)
            (throw e#)
-           (throw (ex-info "Invalid data" {:type :invalid
-                                           :errors errors#})))))))
+           (throw
+            (ex-info
+             (str "Invalid data: "
+                  (string/join " " (vals errors#)))
+             {:type :invalid :errors errors#})))))))
 
 (defn connection []
   (let [db-url (or (env/env :database-url)
@@ -70,7 +74,8 @@
    (if (and (sql-vec? v) (map? opts))
      (transact!
        (jdbc/with-db-connection [db-conn conn]
-         (jdbc/query db-conn v {:row-fn (partial utils/map-keys utils/kebab)})))
+         (jdbc/query db-conn v {:keywordize? true
+                                :identifiers utils/kebab})))
      '()))
   ([conn v]
    (query conn v {})))
@@ -128,9 +133,12 @@
                               ([m where-clause]
                                (query (connection) (sql/update table m where-clause)))
                               ([m]
-                               (query (connection) (sql/update table m)))))
+                               (first (query (connection) (sql/update table m))))))
   (create-root-var "delete" (fn [m]
-                              (query (connection) (sql/delete table m))))
+                              (let [rows (query (connection) (sql/delete table m))]
+                                (if (map? m)
+                                  (first rows)
+                                  rows))))
   (create-root-var "find-by" (fn [m]
                                (let [v (sql/v (sql/find-by table m) m)]
                                  (first (query (connection) v)))))
@@ -147,3 +155,40 @@
                                             (first (query (connection) (sql/insert table m)))
                                             row))))
   nil)
+
+(defn migrate-schema [schema]
+  (jdbc/with-db-connection [conn (connection)]
+    (jdbc/with-db-transaction [t conn]
+      (let [create-statements (schema/create-tables-if-not-exists schema)
+            col-statements (schema/add-columns schema)
+            ident-statements (schema/add-idents schema)
+            rel-statements (schema/add-rels schema)
+            _ (doall
+                (for [s create-statements]
+                  (execute! t s)))
+            _ (doall
+                (for [s ident-statements]
+                  (execute! t s)))
+            _ (doall
+                (for [s col-statements]
+                  (execute! t s)))
+            _ (doall
+                (for [s rel-statements]
+                  (execute! t s)))
+            _ (schema/save schema)]
+        (println "Schema applied successfully")))))
+
+(defn pull [q ident]
+  (coast.pull.db/pull (connection) (schema/fetch) q ident))
+
+(defn fetch [ident]
+  (coast.pull.db/fetch (connection) (schema/fetch) ident))
+
+(defn insert [val]
+  (coast.pull.db/insert (connection) (schema/fetch) val))
+
+(defn update [m ident]
+  (coast.pull.db/update (connection) (schema/fetch) m ident))
+
+(defn delete [ident]
+  (coast.pull.db/delete (connection) (schema/fetch) ident))
